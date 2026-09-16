@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: fasttrack
+          POSTGRES_PASSWORD: fasttrack
+          POSTGRES_DB: fasttrack
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fasttrack -d fasttrack"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://fasttrack:fasttrack@localhost:5432/fasttrack
+      # CI never depends on live OpenAI: everything runs on the deterministic,
+      # network-free providers.
+      EMBEDDING_PROVIDER: deterministic
+      LLM_PROVIDER: deterministic
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check app tests scripts
+
+      - name: Run migrations
+        run: alembic upgrade head
+
+      - name: Run tests with coverage
+        run: |
+          pytest --cov=app --cov-report=term-missing -q
+
+      - name: Seed data and check record count
+        run: python scripts/seed.py
