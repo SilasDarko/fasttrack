@@ -2,42 +2,201 @@
 
 ## Scope
 
-All numbers below were produced by `scripts/benchmark.py` against the deterministic provider (`EMBEDDING_PROVIDER=deterministic`, `LLM_PROVIDER=deterministic`) -- they measure FastTrack's own backend path:
+The measurements in this document were produced by `scripts/benchmark.py` using FastTrack's deterministic providers:
 
-**HTTP routing -> PostgreSQL -> pgvector -> tool dispatch -> deterministic reasoning -> serialization.**
+```text
+EMBEDDING_PROVIDER=deterministic
+LLM_PROVIDER=deterministic
+```
 
-They do **not** include live OpenAI network latency. That is a deliberate choice, not an oversight: OpenAI call latency is dominated by network and model-serving time outside this codebase, and including it would make the number non-reproducible and would not measure anything this project controls. If you configure `LLM_PROVIDER=openai`, expect the `incident_analysis` path to be dominated by the OpenAI round-trip(s) instead -- that is a separate, environment-dependent measurement and is not reported here.
+The benchmark is intended to characterize FastTrack's own backend execution path rather than external model-serving latency.
 
-## How to reproduce
+Depending on the benchmarked path, that includes:
+
+```text
+HTTP / ASGI handling
+→ validation
+→ PostgreSQL
+→ pgvector retrieval
+→ diagnostic tool execution
+→ deterministic reasoning
+→ diagnosis validation
+→ serialization
+```
+
+Live OpenAI latency is intentionally excluded.
+
+When `LLM_PROVIDER=openai` or `EMBEDDING_PROVIDER=openai` is selected, request latency also includes network and provider-serving time. Those measurements are environment-dependent and are not reported here.
+
+## Reproducing the benchmark
+
+Start PostgreSQL and apply the schema:
 
 ```bash
 docker compose up -d db
 alembic upgrade head
 python scripts/seed.py
-uvicorn app.main:app &          # or: docker compose up -d --build
+```
+
+Start the API:
+
+```bash
+uvicorn app.main:app
+```
+
+or run the full stack:
+
+```bash
+docker compose up -d --build
+```
+
+Then execute:
+
+```bash
 python scripts/benchmark.py --n 200 --warmup 20
 ```
 
-## Measured results
+The benchmark performs 20 warmup operations before recording 200 timed operations for each path.
 
-Run on a local machine (Apple Silicon, Docker Desktop for the Postgres/pgvector container, API in the same Docker Compose stack), against a database seeded with 1,248 evidence records, 200 timed requests per path after 20 warmup requests. Latency varies run to run with system load and what's already in the database, so rather than report one run as if it were universally representative, each path below was measured across **three independent runs**:
+## Test environment
 
-| path | run 1 p95 | run 2 p95 | run 3 p95 | p95 range |
-|---|---|---|---|---|
-| retrieval (`retrieve_runbook`, in-process) | 7.2 ms | 8.5 ms | 7.7 ms | 7.2 ms – 8.5 ms |
-| ingestion (`POST /telemetry`) | 9.9 ms | 10.1 ms | 12.3 ms | 9.9 ms – 12.3 ms |
-| incident analysis (`POST /investigations/{id}/run`, full 5-tool agent loop) | 15.83 ms | 17.27 ms | 12.97 ms | 13.0 ms – 17.3 ms |
+The recorded runs were performed on an Apple Silicon development machine with PostgreSQL and pgvector running through Docker Desktop.
 
-Across three independent 200-request runs, incident-analysis p95 ranged from 13.0 ms to 17.3 ms. Where a single summary number is needed elsewhere in this repo, use the conservative end of that range: **17.3 ms p95**.
+The database contained:
 
-What each path actually does:
+```text
+1,248 deterministically seeded evidence records
+```
 
-- **retrieval** -- one `retrieve_runbook` tool call (embed the query, run the pgvector HNSW cosine-distance query, validate + serialize the output), called directly in-process (no HTTP/ASGI layer) so it isolates the DB/vector-search cost specifically.
-- **ingestion** -- one `POST /telemetry` request: request parsing, Pydantic validation, embedding the record, one INSERT, response serialization -- the full HTTP path for the cheapest write.
-- **incident analysis** -- one `POST /investigations/{id}/run` request: the full bounded agent loop, which in the benchmarked case runs all 5 tool calls (telemetry, deployments, runbook, prior incidents, plus whatever the deterministic policy adds) before finalizing and validating the diagnosis. This is the most expensive path by design -- it is doing five times the tool work of a single retrieval call, plus the diagnosis-validation pass.
+Latency varies with machine load, database state, Docker scheduling, caching, and other local conditions. For that reason, results below show three independent runs instead of presenting a single run as universally representative.
 
-## Reading these numbers
+## Results
 
-Incident-analysis p95 (13.0 ms – 17.3 ms across three runs) is well within typical interactive-latency budgets for an operator-facing tool, and is dominated by the number of sequential tool calls the deterministic policy makes (each is a real round-trip to Postgres), not by any single slow operation. Reducing it further would mean either parallelizing independent tool calls (telemetry and runbook lookups don't depend on each other) or reducing the default agent bound -- not something this benchmark implies is currently necessary, but the lever is there in `app/pipeline/investigation.py` if the workload changes.
+| Path | Run 1 p95 | Run 2 p95 | Run 3 p95 | Observed p95 range |
+|---|---:|---:|---:|---:|
+| Retrieval | 7.2 ms | 8.5 ms | 7.7 ms | 7.2–8.5 ms |
+| Ingestion | 9.9 ms | 10.1 ms | 12.3 ms | 9.9–12.3 ms |
+| Incident analysis | 15.83 ms | 17.27 ms | 12.97 ms | 13.0–17.3 ms |
 
-These are single-machine, single-process numbers meant to characterize the code path, not a load test -- there is no concurrency or connection-pool contention modeled here. p50 and max also vary run to run in the same way; re-run `scripts/benchmark.py` for current figures rather than treating any one run (including the ones in the table above) as fixed.
+Across the three recorded 200-request runs, full incident-analysis p95 ranged from:
+
+```text
+13.0 ms to 17.3 ms
+```
+
+When a single conservative summary value is useful, this repository uses:
+
+```text
+17.3 ms p95
+```
+
+This is the highest incident-analysis p95 observed across the three recorded runs rather than the fastest result.
+
+## Benchmark paths
+
+### Retrieval
+
+The retrieval benchmark executes one `retrieve_runbook` operation directly in-process.
+
+The measured path includes:
+
+```text
+query embedding
+→ pgvector cosine-distance query
+→ result validation
+→ serialization
+```
+
+It does not pass through the HTTP/ASGI layer, which makes it useful for isolating the vector-retrieval and database portion of the system.
+
+The schema contains HNSW indexes using `vector_cosine_ops`, but PostgreSQL remains free to choose the execution plan it considers cheapest. At the current dataset size, the benchmark does not assume that every retrieval operation necessarily uses the HNSW index.
+
+### Ingestion
+
+The ingestion benchmark sends:
+
+```text
+POST /telemetry
+```
+
+The measured path includes:
+
+```text
+HTTP request handling
+→ Pydantic validation
+→ deterministic embedding generation
+→ PostgreSQL INSERT
+→ response serialization
+```
+
+This represents a relatively small write path in FastTrack.
+
+### Incident analysis
+
+The incident-analysis benchmark sends:
+
+```text
+POST /investigations/{id}/run
+```
+
+For the benchmarked fixture, the deterministic reasoning policy exercises all five diagnostic tools before finalization.
+
+The path includes:
+
+```text
+HTTP request handling
+→ bounded reasoning loop
+→ telemetry lookup
+→ deployment lookup
+→ source-change inspection
+→ runbook retrieval
+→ prior-incident retrieval
+→ tool-output validation
+→ evidence-reference validation
+→ diagnosis finalization
+→ response serialization
+```
+
+This is the broadest measured request path in the benchmark suite.
+
+## Interpreting the results
+
+The incident-analysis benchmark involves several sequential database-backed diagnostic operations, so its latency is higher than either a single retrieval or a telemetry write.
+
+The benchmarked reasoning provider is deterministic and runs locally. It therefore does not model the latency of a remotely hosted language model.
+
+Potential ways to reduce backend latency further include:
+
+- parallelizing diagnostic operations that do not depend on one another
+- reducing unnecessary database round-trips
+- batching compatible retrieval operations
+- tuning PostgreSQL and pgvector as the evidence corpus grows
+- revisiting the maximum reasoning-iteration bound for different workloads
+
+Those are architectural options rather than conclusions drawn from the current benchmark alone.
+
+## Limitations
+
+These results are intended to characterize local backend execution, not production capacity.
+
+The benchmark does **not** measure:
+
+- concurrent user load
+- sustained throughput
+- connection-pool saturation
+- multi-process API deployment
+- distributed database latency
+- cross-region networking
+- live OpenAI latency
+- production-scale evidence corpora
+- HNSW recall under large-scale approximate search
+
+The benchmark runs on a single development machine against a locally hosted Dockerized database.
+
+Results should therefore be interpreted as reproducible development measurements of FastTrack's code paths, not as production service-level guarantees.
+
+To obtain current numbers on another machine or database state, rerun:
+
+```bash
+python scripts/benchmark.py --n 200 --warmup 20
+```
