@@ -2,77 +2,351 @@
 
 ## Data model
 
-Six evidence/domain tables hold the raw operational record; three workflow/state tables hold the investigation lifecycle.
+FastTrack uses six domain tables for operational data and three workflow/state tables for the investigation lifecycle.
 
-**Evidence/domain** (each with an `embedding VECTOR(1536)` column):
-- `telemetry_events` -- service, level, message, host, tags, timestamp
-- `deployments` -- service, version, commit_sha, environment, status, deployed_at
-- `source_changes` -- repo, commit_sha (unique), author, message, files_changed, diff_stat, timestamp
-- `runbooks` -- title, service, content, tags, updated_at (staleness is derived from this at read time, not stored)
-- `prior_incidents` -- title, service, summary, root_cause, resolution, occurred_at
-- `alerts` -- service, severity, message, fingerprint (unique -- the ingestion idempotency key), status
+### Domain tables
 
-**Workflow/state**:
-- `investigations` -- alert_id, status (`pending` -> `completed`|`failed` -> `approved`|`rejected`), diagnosis (JSON), suggested_action, postmortem_draft
-- `tool_execution_logs` -- one row per tool call: investigation_id, tool_name, input/output JSON, status, error_code, latency_ms
-- `approvals` -- investigation_id, action, decision (`approved`|`rejected`), decided_at -- the source of truth for the approval gate; re-approving looks up an existing row here rather than trusting a status enum, which is what makes approval idempotent under retries
+The five retrievable evidence tables — `telemetry_events`, `deployments`, `source_changes`, `runbooks`, and `prior_incidents` — include an `embedding VECTOR(1536)` column for similarity search.
+
+- `telemetry_events` — service, level, message, host, tags, timestamp
+- `deployments` — service, version, commit_sha, environment, status, deployed_at
+- `source_changes` — repo, commit_sha, author, message, files_changed, diff_stat, timestamp
+- `runbooks` — title, service, content, tags, updated_at
+- `prior_incidents` — title, service, summary, root_cause, resolution, occurred_at
+- `alerts` — service, severity, message, fingerprint, status
+
+`alerts` are workflow inputs rather than retrievable evidence records, so they do not require an embedding column.
+
+The `fingerprint` field on `alerts` is unique and acts as the ingestion idempotency key. Runbook staleness is derived from `updated_at` at read time rather than stored as a separate field.
+
+### Workflow/state tables
+
+- `investigations` — alert_id, status, diagnosis JSON, suggested_action, postmortem_draft
+- `tool_execution_logs` — investigation_id, tool_name, input/output JSON, status, error_code, latency_ms
+- `approvals` — investigation_id, action, decision, decided_at
+
+`approvals` is the source of truth for the approval gate. Repeated approval requests first check for an existing row instead of relying only on the investigation status, which makes approval idempotent under retries.
 
 ## pgvector indexing
 
-Each evidence table's `embedding` column has a real `HNSW` index with the cosine-distance operator class, created explicitly in the Alembic migration:
+Each retrievable evidence table has an HNSW index on its embedding column using cosine distance. The indexes are created explicitly in the Alembic migration:
 
 ```sql
-CREATE INDEX ix_<table>_embedding_hnsw ON <table> USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX ix_<table>_embedding_hnsw
+ON <table>
+USING hnsw (embedding vector_cosine_ops);
 ```
 
-This is approximate nearest-neighbor search, not exact/brute-force scan -- the tradeoff is standard for pgvector: HNSW gives sub-linear query time at the cost of a small amount of recall versus exact search, which is the right tradeoff once a table has more than a few thousand rows. At the current seed size (a few hundred rows per table) the two are indistinguishable in practice; the index is still real and exercised by every `retrieve_runbook` / `search_prior_incidents` call, and by the fault-injection matrix's `vector_query_failure` cases.
+HNSW provides approximate nearest-neighbor search rather than an exact brute-force scan. The tradeoff is lower search cost as the corpus grows in exchange for approximate rather than exact nearest-neighbor retrieval.
 
-A real, separately useful discovery from building this: pgvector's Python client validates the embedding's dimensionality *before* the query ever reaches Postgres, raising `ValueError` (wrapped by SQLAlchemy as `StatementError`) rather than a server-side error. The tool executor treats that identically to a genuine server-side pgvector failure (`DBAPIError`) -- both surface as `vector_search_failed`. See `app/tools/retrieve_runbook.py` / `search_prior_incidents.py`.
+At the current seed size, PostgreSQL may still choose a sequential scan depending on planner cost estimates. The HNSW indexes are present in the schema and become increasingly useful as the evidence corpus grows.
+
+A useful implementation detail surfaced while testing vector failures: pgvector's Python client validates embedding dimensionality before the query reaches PostgreSQL. A malformed vector can therefore raise `ValueError`, commonly wrapped by SQLAlchemy as `StatementError`, rather than a database-side error.
+
+The vector-search tools normalize both client-side validation failures and database-side pgvector failures into the same structured `vector_search_failed` error path.
+
+Relevant implementations:
+
+- `app/tools/retrieve_runbook.py`
+- `app/tools/search_prior_incidents.py`
 
 ## Provider abstractions
 
-Two seams make the AI layer swappable and the test suite network-free:
+FastTrack separates application logic from the model and embedding providers so the system can run deterministically in tests, CI, and benchmarks while still supporting a real OpenAI-backed path.
 
-**`EmbeddingProvider.embed(text) -> list[float]`** (`app/embeddings/`)
-- `DeterministicEmbeddingProvider` (default): a hashing-trick / random-projection embedding. Each distinct token maps to a fixed pseudo-random unit vector seeded from its SHA-256 hash; a text's embedding is the term-frequency-weighted sum of its tokens' vectors, L2-normalized. Same text -> identical vector, always; shared vocabulary between two texts pulls their vectors closer, which is what makes similarity ranking meaningful without any model or network call. It is not semantically meaningful the way a trained embedding is -- see DESIGN_DECISIONS.md.
-- `OpenAIEmbeddingProvider`: real `text-embedding-3-small` calls, used only when `EMBEDDING_PROVIDER=openai` and `OPENAI_API_KEY` is set.
-- Selecting `openai` without a key raises `ConfigurationError` at startup -- it never silently falls back to the deterministic provider.
+### Embedding provider
 
-**`ReasoningProvider.decide_next_action(context) -> ToolCallAction | FinalizeAction`** (`app/reasoning/`)
-- `DeterministicReasoningProvider` (default): a fixed but context-sensitive policy, not a single hardcoded response. It inspects the tool outputs accumulated so far and branches: telemetry -> (deployments, if elevated severity) -> (inspect_change, if a deployment correlates) -> runbook -> prior incidents -> finalize, bounded to 5 tool calls. Finalizing builds the diagnosis's `evidence_refs` **only** from records actually present in tool outputs already in the conversation, computes confidence from a deterministic formula, and detects+flags conflicting prior-incident evidence.
-- `OpenAIProvider`: a real function-calling loop against the same 5 tool JSON schemas, finalized via a structured JSON response validated against the `Diagnosis` schema, with one retry on invalid output.
-- Same fail-fast rule on a missing API key.
+```python
+EmbeddingProvider.embed(text) -> list[float]
+```
 
-## The 5 diagnostic tools
+The implementations live under `app/embeddings/`.
 
-`app/tools/{search_telemetry,search_deployments,retrieve_runbook,search_prior_incidents,inspect_change}.py`, registered in `app/tools/base.py`. Every tool: has a Pydantic input schema (also emitted as an OpenAI function-calling JSON schema) and output schema; runs one explicitly-ordered, `LIMIT`-clamped query (clamped in code, not just validated, so a caller requesting 999 results still gets at most `tool_max_limit`); is read-only; and is invoked exclusively through `app/tools/executor.py`, which:
+#### DeterministicEmbeddingProvider
 
-1. validates input against the tool's input model,
-2. runs the handler, translating `VectorSearchError`, `(OperationalError, DBAPIError, StatementError, TimeoutError)` into structured `error_code`s instead of letting them propagate,
-3. validates the handler's output against the tool's output model (`tool_output_invalid` on failure),
-4. logs a `ToolExecutionLog` row with latency, and
-5. records Prometheus metrics.
+The default provider uses a deterministic hashing-based embedding.
+
+Each normalized token maps to a fixed pseudo-random vector derived from its SHA-256 hash. Token vectors are combined using term-frequency weighting and then L2-normalized.
+
+This gives several useful properties:
+
+- identical input produces the same vector across runs
+- shared vocabulary increases vector similarity
+- no network access or API key is required
+- pgvector integration remains real even when the embedding provider is local
+
+The deterministic embedding is intentionally not equivalent to a trained semantic model. Texts with similar meaning but different vocabulary may not be placed near each other.
+
+#### OpenAIEmbeddingProvider
+
+The OpenAI-backed implementation uses `text-embedding-3-small`.
+
+It is selected only when:
+
+```text
+EMBEDDING_PROVIDER=openai
+```
+
+and a valid:
+
+```text
+OPENAI_API_KEY
+```
+
+is available.
+
+Selecting the OpenAI provider without a key raises `ConfigurationError`. FastTrack never silently falls back to the deterministic provider.
+
+## Reasoning provider
+
+```python
+ReasoningProvider.decide_next_action(context)
+    -> ToolCallAction | FinalizeAction
+```
+
+The implementations live under `app/reasoning/`.
+
+### DeterministicReasoningProvider
+
+The default reasoning provider is deterministic but context-sensitive.
+
+It does not return one hardcoded response. Instead, it examines the evidence collected so far and decides which diagnostic tool to call next.
+
+A typical path is:
+
+```text
+telemetry
+    ↓
+deployments, if elevated evidence is present
+    ↓
+inspect_change, if a deployment correlates
+    ↓
+runbook
+    ↓
+prior incidents
+    ↓
+finalize
+```
+
+The loop is bounded to at most five diagnostic tool calls.
+
+When finalizing, the provider:
+
+- builds `evidence_refs` only from records actually returned during the current investigation
+- computes confidence from a deterministic formula
+- lowers confidence when evidence conflicts
+- identifies disagreement among prior incidents instead of hiding it
+
+### OpenAIProvider
+
+The OpenAI reasoning implementation uses the same five diagnostic tool schemas through function calling.
+
+The final model response is validated against the `Diagnosis` schema. Invalid structured output receives one retry before the investigation fails with a typed error.
+
+Like the embedding provider, selecting OpenAI without a configured API key fails explicitly.
+
+## Diagnostic tools
+
+FastTrack exposes exactly five read-only diagnostic tools:
+
+1. `search_telemetry`
+2. `search_deployments`
+3. `retrieve_runbook`
+4. `search_prior_incidents`
+5. `inspect_change`
+
+They are implemented under `app/tools/` and registered through the shared tool registry.
+
+Each tool has:
+
+- a Pydantic input schema
+- a Pydantic output schema
+- a bounded SQL query
+- explicit ordering
+- a server-side result limit
+- read-only behavior
+
+The same input schemas can also be emitted as JSON schemas for OpenAI function calling.
+
+All tool execution passes through `app/tools/executor.py`, which performs the following steps:
+
+1. validate input against the tool's Pydantic input model
+2. execute the handler
+3. translate expected database, timeout, and vector failures into structured error codes
+4. validate the handler output against the tool's output model
+5. record a `ToolExecutionLog` row with latency and status
+6. update Prometheus metrics
+
+Result limits are enforced in application code rather than relying only on validation. A caller requesting an excessive number of records still receives at most the configured maximum.
 
 ## Investigation pipeline
 
-`app/pipeline/investigation.py` runs the bounded agent loop (`app/config.py: agent_max_iterations`, default 6): each iteration asks the reasoning provider for the next action, executes a tool call or breaks on `FinalizeAction`. If the reasoning provider itself is unavailable (`LLMUnavailableError`/`LLMOutputInvalidError`) the investigation is marked `failed` with a structured reason rather than crashing the request.
+`app/pipeline/investigation.py` runs the bounded diagnostic loop.
 
-Before a diagnosis is accepted, `app/pipeline/diagnosis_validation.py` checks every `evidence_ref` against the set of (type, id) pairs actually returned by this investigation's tool calls -- **not** just against "does this id exist in the database" -- which is what prevents a hallucinated-but-real-looking id from passing. A failing diagnosis gets exactly one retry (asking the provider to finalize again); a second failure marks the investigation `failed` with `diagnosis_invalid`.
+The maximum number of reasoning iterations is configured through:
+
+```text
+agent_max_iterations
+```
+
+with a default of 6.
+
+Each iteration asks the reasoning provider for its next action. The provider may either:
+
+- request one of the five diagnostic tools, or
+- return a `FinalizeAction`
+
+If the reasoning provider becomes unavailable or returns invalid output, the investigation is marked `failed` with a structured reason rather than causing an unhandled server error.
+
+## Evidence validation
+
+Before a diagnosis is accepted, `app/pipeline/diagnosis_validation.py` validates every `evidence_ref`.
+
+The important rule is that an evidence reference must have been returned by a tool during the current investigation.
+
+FastTrack does not merely ask:
+
+```text
+Does this database record exist?
+```
+
+It asks:
+
+```text
+Was this exact record actually retrieved during this investigation?
+```
+
+This prevents a diagnosis from citing a real database row that the reasoning provider never observed.
+
+If validation fails, the provider receives one opportunity to finalize again. A second failure marks the investigation as:
+
+```text
+diagnosis_invalid
+```
 
 ## Approval gate and postmortem
 
-`POST /investigations/{id}/approve|reject` requires the investigation to be `completed` (409 otherwise) and is idempotent: it looks for an existing `Approval` row for that investigation before writing a new one, so retried or duplicate approval requests return the same result without side effects. Approval generates a postmortem draft via `app/pipeline/postmortem.py`, a deterministic template over the already-validated `Diagnosis` -- not a fresh LLM call -- so the document is auditable and provider-independent.
+The approval flow is exposed through:
 
-## Errors
+```text
+POST /investigations/{id}/approve
+POST /investigations/{id}/reject
+```
 
-All expected failures are typed (`app/errors.py`, `FastTrackError` subclasses) and rendered as a consistent `{error_code, message, detail}` JSON body by a single exception handler, plus dedicated handlers for FastAPI's own `RequestValidationError` and for `SQLAlchemyError` (so a DB failure outside a tool call -- e.g. during ingestion or approval -- is still a structured 503, never a bare 500).
+An investigation must be in the `completed` state before either action is accepted.
+
+Approval and rejection are idempotent. Before writing a new decision, the application checks whether an `Approval` row already exists for the investigation.
+
+Repeated requests therefore return the existing result without creating duplicate side effects.
+
+An approved investigation generates a postmortem draft through:
+
+```text
+app/pipeline/postmortem.py
+```
+
+Postmortem generation is deterministic and uses the already-validated diagnosis. It does not make a new LLM call, which keeps the generated document auditable and independent of the active reasoning provider.
+
+## Error handling
+
+Expected failures are represented by typed exceptions in:
+
+```text
+app/errors.py
+```
+
+All `FastTrackError` subclasses are converted into a consistent JSON response:
+
+```json
+{
+  "error_code": "...",
+  "message": "...",
+  "detail": {}
+}
+```
+
+FastAPI request-validation errors and SQLAlchemy failures also have dedicated handlers.
+
+This means database failures outside tool execution — such as ingestion or approval failures — still return structured responses instead of unhandled HTTP 500 errors.
 
 ## Metrics and dashboards
 
-8 Prometheus metrics (`app/metrics.py`): `http_request_duration_seconds`, `tool_execution_duration_seconds`, `tool_execution_failures_total`, `retrieval_duration_seconds`, `ingestion_records_total`, `investigations_total`, `llm_call_duration_seconds`, `llm_calls_total`. `monitoring/grafana/dashboards/fasttrack.json` provisions an 8-panel dashboard (request rate, latency percentiles, tool duration/failure by tool, retrieval latency by evidence type, ingestion throughput, investigations by status, LLM latency/error rate) automatically on `docker compose up`.
+FastTrack exposes eight Prometheus metrics:
+
+- `http_request_duration_seconds`
+- `tool_execution_duration_seconds`
+- `tool_execution_failures_total`
+- `retrieval_duration_seconds`
+- `ingestion_records_total`
+- `investigations_total`
+- `llm_call_duration_seconds`
+- `llm_calls_total`
+
+The Grafana configuration provisions eight panels automatically through Docker Compose:
+
+1. API request rate
+2. API latency percentiles
+3. tool execution duration by tool
+4. tool failure rate by tool and error code
+5. retrieval latency
+6. ingestion throughput
+7. investigations by status
+8. reasoning-provider latency and error rate
+
+The dashboard configuration lives at:
+
+```text
+monitoring/grafana/dashboards/fasttrack.json
+```
 
 ## Testing strategy
 
-`tests/*.py` (49 functional/integration tests) exercise the application through real Postgres+pgvector -- no mocking of the database, ever. The OpenAI *reasoning* adapter's request/response mapping (`app/reasoning/openai_provider.py`, 86% covered) is tested separately (`tests/test_openai_adapter.py`) against a fake transport, verifying tool-call and finalize-response parsing without any live API call. The OpenAI *embedding* adapter (`app/embeddings/openai_provider.py`) is implemented behind the same `EmbeddingProvider` interface but is not exercised by the automated suite (0% coverage) -- there is no fake-transport test for it yet, and it is only ever run manually with a real `OPENAI_API_KEY`.
+FastTrack currently has 49 functional and integration tests.
 
-`tests/faults/` is a **test-only** fault-injection harness (nothing here ships in `app/`): it monkeypatches the ordinary dependency seams application code already exposes (a `session` parameter, provider factories, the tool registry) to reproduce 10 realistic failure modes, each applied across 5 targets x 5 input variations = 250 parametrized cases in `tests/test_fault_injection.py`. See DESIGN_DECISIONS.md for what "target" means per fault type and why the matrix is shaped this way.
+The tests exercise the application against real PostgreSQL and pgvector rather than replacing the database with an in-memory mock.
+
+The OpenAI reasoning adapter's request/response mapping is tested separately through a fake transport. This verifies tool-call parsing and structured finalization without requiring a live OpenAI request.
+
+The OpenAI embedding adapter is implemented behind the same `EmbeddingProvider` interface but is not exercised by the automated suite. Exercising it requires selecting the OpenAI provider and supplying a real `OPENAI_API_KEY`.
+
+### Fault injection
+
+The fault-injection framework lives entirely under:
+
+```text
+tests/faults/
+```
+
+No fault-injection logic is shipped inside `app/`.
+
+The test harness overrides ordinary application seams such as:
+
+- database sessions
+- provider factories
+- tool registry behavior
+
+The suite contains 250 parametrized fault-injection cases:
+
+```text
+10 fault types
+× 5 targets
+× 5 input variations
+= 250 cases
+```
+
+These cases remain separate from the 49 functional/integration tests rather than being presented as one combined test-count headline.
+
+The matrix covers failures such as:
+
+- database unavailability
+- malformed telemetry
+- missing deployments
+- stale runbooks
+- conflicting evidence
+- reasoning-provider timeouts
+- invalid tool output
+- duplicate alerts
+- vector-query failures
+- unavailable dependencies
+
+The goal is to verify that expected failures are converted into structured application behavior rather than unhandled exceptions.
