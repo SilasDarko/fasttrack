@@ -1,51 +1,271 @@
-# Design decisions
+# Design Decisions
 
-Non-obvious choices, and why. Ordered roughly by how likely they are to come up in review.
+This document records implementation choices that are not obvious from the code alone, along with the tradeoffs behind them.
 
-## Deterministic providers as the default, not a test-only stub
+## Deterministic providers are first-class implementations
 
-`DeterministicEmbeddingProvider` and `DeterministicReasoningProvider` are real implementations behind the same interfaces as the OpenAI ones -- not mocks swapped in only for tests. The reasoning provider genuinely branches on tool output content (elevated telemetry vs. not, a correlated deployment vs. not, conflicting prior incidents vs. not) and the embedding provider genuinely writes and queries real vectors through pgvector. This means:
+FastTrack defaults to `DeterministicEmbeddingProvider` and `DeterministicReasoningProvider` rather than treating deterministic behavior as a test-only mock.
 
-- CI, the seed script, and the benchmark script never need `OPENAI_API_KEY` and never touch the network.
-- The full pipeline -- tool orchestration, evidence citation, the anti-hallucination check, the approval gate -- is exercised end-to-end without depending on a model's non-determinism.
-- The OpenAI-backed providers are still fully implemented (`app/embeddings/openai_provider.py`, `app/reasoning/openai_provider.py`) and used automatically the moment `EMBEDDING_PROVIDER=openai` / `LLM_PROVIDER=openai` and a key are set -- there is no separate "demo mode" code path to keep in sync.
+Both implementations use the same interfaces as the OpenAI-backed providers.
 
-The tradeoff: the deterministic embedding is a hashing-trick / random-projection embedding, not a trained model. It is reproducible and lexically sensitive (shared vocabulary pulls vectors closer) but not semantically meaningful -- "connection pool exhausted" and "too many open connections" would not necessarily rank close together, where a real embedding model would likely place them close. Retrieval-ranking *tests* rely on hand-constructed vectors or shared-vocabulary phrasing specifically to avoid depending on that semantic quality; a live demo with real incident text would benefit from switching to the OpenAI provider.
+The deterministic reasoning provider examines accumulated tool results and changes its next action based on the evidence available. For example, elevated telemetry can lead to deployment inspection, a correlated deployment can lead to source-change inspection, and conflicting prior incidents affect the final diagnosis.
 
-## Anti-hallucination check validates against tool history, not just the database
+The deterministic embedding provider produces stable 1536-dimensional vectors that are stored and queried through the same PostgreSQL + pgvector path used by the OpenAI embedding provider.
 
-`diagnosis_validation.py` rejects an `evidence_ref` unless it was returned by a tool call *this investigation actually made* -- checking only "does this id exist in the database" would pass a coincidentally-real id the model never actually retrieved, which is precisely the failure mode this exists to catch. The database-existence check runs too, as defense in depth against a tool bug that returned an id which no longer resolves to a row.
+This design allows:
 
-## Postmortem generation is a template, not a second LLM call
+- CI to run without external network access
+- benchmarks to measure FastTrack rather than model-provider latency
+- seed generation to remain reproducible
+- tool orchestration and evidence validation to run end-to-end
+- provider-specific behavior to remain isolated behind common interfaces
 
-The postmortem is built deterministically from the already-validated `Diagnosis` object (`pipeline/postmortem.py`). An LLM call here would reintroduce the exact hallucination risk the diagnosis validator was built to close, cost an extra round-trip on the approval path, and make postmortems non-reproducible. Every sentence in the document traces back to a field that was already checked.
+The OpenAI-backed implementations remain available through:
 
-## Approval idempotency uses a dedicated `approvals` table, not a status flag
+```text
+EMBEDDING_PROVIDER=openai
+LLM_PROVIDER=openai
+OPENAI_API_KEY=...
+```
 
-Keying idempotency off `Investigation.status` alone would conflate "has this been decided" with "what is the current lifecycle stage," and would make it easy to accidentally re-run side effects (regenerating the postmortem, double-counting a metric) on a retried request. A separate `Approval` row per (investigation, action) is the source of truth: approving twice looks up the existing row and returns it unchanged.
+Selecting an OpenAI provider without a configured API key fails explicitly rather than silently changing providers.
 
-## Alert deduplication survives a concurrency race, not just sequential retries
+### Tradeoff
 
-The obvious approach -- `SELECT` for an existing fingerprint, `INSERT` if none found -- has a race: two concurrent requests can both miss the `SELECT` and both attempt the `INSERT`, and the second loses to the unique constraint. `ingest_alert` catches that `IntegrityError`, rolls back, and re-queries for the row the other request just created, so a losing request still returns the correct (existing) alert and investigation id instead of a 500. Covered by `tests/test_duplicate_alerts.py`'s concurrent case and by the fault-injection matrix's `duplicate_alerts` scenarios.
+The deterministic embedding is based on token hashing rather than a trained semantic model.
 
-## A single consolidated initial migration, not autogenerated incremental ones
+Shared vocabulary tends to increase similarity, but semantically equivalent phrases with different vocabulary may still be far apart. For example:
 
-`alembic/versions/0001_initial.py` creates the `vector` extension, all tables from `Base.metadata` (the ORM models, not a hand-duplicated DDL description), and the HNSW indexes explicitly. For a project's first schema this avoids the two DDL descriptions (models vs. hand-written migration) drifting apart, at the cost of the migration not being a literal record of schema history. Any schema change from here forward would be a normal incremental Alembic revision.
+```text
+connection pool exhausted
+```
 
-## Tool call limits are clamped, not just validated
+and:
 
-A tool's `limit` parameter has no upper bound in its Pydantic schema (`ge=1` only) -- it's clamped in the handler to `settings.tool_max_limit` / `retrieval_max_limit` instead of rejecting an out-of-range request. An agent (deterministic or model-driven) asking for "more than allowed" is a normal, recoverable situation, not a client error worth a 422; clamping keeps the tool call itself always successful and bounded, and the executor logs the actual `limit` used.
+```text
+too many open connections
+```
 
-## Fault injection lives only in tests/, and each fault type's "target" axis means something different
+may describe the same operational condition without producing the similarity a trained embedding model would.
 
-`tests/faults/` is never imported by `app/` -- production code exposes only ordinary dependency seams (a `session` parameter, provider factories, the tool registry), and the fault harness monkeypatches those seams from the test side. The 10 x 5 x 5 = 250 matrix (`tests/faults/matrix.py`) keeps a regular shape, but "target" (0-4) is deliberately *not* forced to mean "which of the 5 tools" for every fault type, since that would be artificial for faults that are inherently about one specific scenario:
+Retrieval tests therefore use controlled phrasing or hand-constructed vectors when the test is intended to verify ranking behavior independently of embedding quality.
 
-- `db_timeout`, `invalid_tool_output`: target = which of the 5 tools (this genuinely applies uniformly -- every tool shares the same executor error-handling path).
-- `vector_query_failure`: target = 5 realistic pgvector-layer failure variants (embedding-dimension mismatch -- which Postgres/pgvector genuinely rejects, not a fabricated exception -- and a constructed extension/operator-unavailable error using Postgres's real error text), split across the two vector-search tools.
-- `missing_deployment`, `stale_runbook`, `conflicting_evidence`, `openai_timeout`, `duplicate_alerts`, `unavailable_dependency`: target = 5 realistic variants of that specific scenario (e.g. `unavailable_dependency`'s 5 targets are 5 different dependency-failure sites: DB during ingestion, DB mid-investigation, an agent-level dependency, the embedding provider, DB during retrieval).
+## Evidence validation uses investigation history
 
-`variation_idx` (0-4) then varies the input (service, message, payload shape) within each target, so a fault's handling is proven across more than one cherry-picked example. This is documented per fault type in `tests/faults/scenarios.py` and summarized in ARCHITECTURE.md.
+A diagnosis may reference only evidence that was actually returned during the current investigation.
 
-## Ingestion and analysis are separate HTTP calls
+`app/pipeline/diagnosis_validation.py` checks each `evidence_ref` against the `(type, id)` pairs collected from tool outputs.
 
-`POST /alerts` only creates the `Alert` and a `pending` `Investigation`; it does not run the agent loop inline. `POST /investigations/{id}/run` does that. Combining them would conflate two very differently-shaped costs (a single insert vs. up to 5 tool calls plus a reasoning round-trip) into one endpoint and one latency number, which is also why they are benchmarked separately -- see BENCHMARKS.md.
+This is intentionally stricter than checking only whether a referenced row exists in the database.
+
+A database-only check could accept a valid row that the reasoning provider never retrieved. That would allow a diagnosis to cite information outside its observed evidence.
+
+The validation therefore asks two separate questions:
+
+```text
+Was this record returned during this investigation?
+Does the referenced record still resolve correctly?
+```
+
+The second check provides defense in depth against stale or invalid tool output.
+
+## Postmortem generation does not invoke the reasoning provider again
+
+Postmortems are generated deterministically from the validated `Diagnosis` object in:
+
+```text
+app/pipeline/postmortem.py
+```
+
+The approval path does not make another LLM call.
+
+This keeps the generated document tied to evidence that has already passed diagnosis validation and avoids introducing a new opportunity for unsupported content during postmortem generation.
+
+It also keeps approval behavior reproducible regardless of which reasoning provider produced the original diagnosis.
+
+## Approval state has its own table
+
+Approval state is stored in `approvals` instead of being represented only by `Investigation.status`.
+
+These concepts describe different things:
+
+```text
+Investigation.status
+    → where the investigation is in its lifecycle
+
+Approval
+    → the recorded decision associated with that investigation
+```
+
+The approval endpoint checks for an existing decision before creating another one.
+
+This makes repeated approval or rejection requests idempotent and avoids repeating side effects such as postmortem generation or metric updates during client retries.
+
+## Alert deduplication handles concurrent inserts
+
+Alert fingerprints have a database uniqueness constraint.
+
+A simple implementation could:
+
+```text
+SELECT by fingerprint
+→ if missing
+→ INSERT
+```
+
+but that is not enough under concurrency.
+
+Two requests can perform the initial lookup at nearly the same time, both observe no row, and then both attempt the insert.
+
+FastTrack lets the database uniqueness constraint resolve the race. If the insert loses with an `IntegrityError`, `ingest_alert`:
+
+1. rolls back the failed transaction
+2. queries the fingerprint again
+3. returns the alert created by the competing request
+
+The losing request therefore receives the existing alert instead of an internal server error.
+
+This behavior is covered by the duplicate-alert tests and fault-injection cases.
+
+## The initial migration is intentionally consolidated
+
+`alembic/versions/0001_initial.py` represents the first complete FastTrack schema.
+
+It:
+
+- creates the pgvector extension
+- creates the application tables
+- creates the vector indexes
+- establishes the initial database structure in one migration
+
+Because this is the first schema version, there is no earlier migration history to preserve.
+
+Future schema changes should be represented as normal incremental Alembic revisions rather than modifying `0001_initial.py` after the schema has become shared history.
+
+## Tool result limits are clamped in the handlers
+
+Diagnostic tool inputs require a positive `limit`, but the caller is not trusted to choose an appropriate maximum.
+
+The actual query limit is clamped against FastTrack configuration such as:
+
+```text
+tool_max_limit
+retrieval_max_limit
+```
+
+This means a request such as:
+
+```text
+limit=999
+```
+
+does not cause an unbounded query.
+
+The handler executes using the configured maximum instead.
+
+Clamping was chosen instead of rejecting the request because an excessive result request from a reasoning provider is recoverable. The tool can still return a useful bounded result without turning the interaction into a schema-validation failure.
+
+## Fault injection remains outside production code
+
+Fault-injection utilities live under:
+
+```text
+tests/faults/
+```
+
+Production code does not import them.
+
+The application exposes ordinary seams that are useful independently of testing:
+
+- database-session dependencies
+- provider factories
+- tool registration and execution boundaries
+
+The fault harness overrides those seams from the test side.
+
+This keeps production modules free of test-specific switches while still allowing failures to be reproduced deterministically.
+
+## The fault matrix uses scenario-specific targets
+
+The fault matrix contains:
+
+```text
+10 fault types
+× 5 targets
+× 5 input variations
+= 250 parametrized cases
+```
+
+The meaning of `target` is intentionally specific to the failure being tested rather than being forced to mean “one of the five tools” in every case.
+
+For failures that genuinely apply to all tools, such as database timeouts or invalid tool outputs, the five targets correspond to the five diagnostic tools.
+
+For scenario-specific failures, the target dimension instead represents five meaningful variants of that failure.
+
+Examples include:
+
+- database timeout at different tool boundaries
+- missing-deployment variants
+- stale-runbook variants
+- conflicting-evidence variants
+- reasoning-provider timeout variants
+- duplicate-alert race variants
+- dependency failures at different application boundaries
+
+### Vector-query failures
+
+Vector-search failures deserve separate handling because they can originate at different layers.
+
+One case discovered during implementation was an embedding dimension mismatch.
+
+The pgvector Python integration validates vector dimensionality before the SQL query reaches PostgreSQL. Depending on where the exception is surfaced, this can appear as a Python `ValueError` or as a SQLAlchemy `StatementError`.
+
+Other failures may originate from PostgreSQL or the pgvector operator path and surface as database exceptions.
+
+The retrieval tools normalize these expected vector-search failures into:
+
+```text
+vector_search_failed
+```
+
+rather than leaking library-specific exceptions through the API.
+
+`variation_idx` changes the input associated with each target so the suite does not prove behavior using only one fixed payload.
+
+The detailed scenario definitions live in:
+
+```text
+tests/faults/scenarios.py
+```
+
+## Alert ingestion and investigation execution are separate operations
+
+Creating an alert and analyzing an incident are exposed as separate HTTP operations.
+
+```text
+POST /alerts
+```
+
+creates the alert and its pending investigation.
+
+```text
+POST /investigations/{id}/run
+```
+
+executes the diagnostic pipeline.
+
+The two operations have very different cost profiles.
+
+Alert ingestion is primarily a small database write, while investigation execution can involve:
+
+- several diagnostic tool calls
+- multiple PostgreSQL queries
+- vector retrieval
+- reasoning-provider decisions
+- diagnosis validation
+
+Keeping them separate makes retries, observability, error handling, and latency measurement easier to reason about.
+
+It also prevents the inexpensive alert-ingestion path from being coupled to the much larger analysis path.
+
+The two operations are benchmarked separately in `BENCHMARKS.md`.
