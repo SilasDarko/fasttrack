@@ -1,118 +1,402 @@
 # FastTrack
 
-FastTrack is a FastAPI service that investigates production incidents by correlating telemetry, deployments, source changes, runbooks, and prior incidents, then produces an evidence-backed diagnosis through a bounded, tool-using reasoning agent. A human approval gate stands between the diagnosis and any suggested action, and an approved investigation generates a postmortem draft automatically.
+FastTrack is a FastAPI incident-analysis service that correlates telemetry, deployments, source changes, runbooks, and prior incidents to produce evidence-backed diagnoses.
 
-The reasoning and embedding layers are pluggable: a deterministic, network-free implementation is used by default (and by all tests, CI, and benchmarks), with a real OpenAI-backed implementation available behind the same interface for interactive use.
+Investigations run through a bounded reasoning loop with five read-only diagnostic tools. Every evidence reference in a diagnosis is validated against records actually returned during that investigation before the result can be accepted.
+
+A human approval gate separates diagnosis from any suggested action. Approved investigations produce a deterministic postmortem draft derived from the validated diagnosis.
+
+FastTrack supports both deterministic local providers and optional OpenAI-backed providers. The deterministic providers are used by default for local development, testing, CI, seeding, and benchmarks so the system remains reproducible and does not require network access or an API key.
 
 ## Stack
 
-Python, FastAPI, SQLAlchemy (async), PostgreSQL + pgvector, Alembic, OpenAI SDK (optional), Prometheus, Grafana, pytest, Docker Compose.
+- Python
+- FastAPI
+- SQLAlchemy Async
+- PostgreSQL
+- pgvector
+- Alembic
+- OpenAI SDK
+- Prometheus
+- Grafana
+- pytest
+- Docker Compose
 
-## Architecture at a glance
+## Architecture
 
+```text
+Alert
+  |
+  v
+Investigation (pending)
+  |
+  v
+Bounded reasoning loop
+  |
+  +--> search_telemetry
+  +--> search_deployments
+  +--> retrieve_runbook
+  +--> search_prior_incidents
+  +--> inspect_change
+  |
+  v
+Diagnosis
+  |
+  +--> evidence references validated against
+       records actually retrieved during
+       this investigation
+  |
+  v
+Approve / Reject
+  |
+  v
+Postmortem draft on approval
 ```
-alert --> Investigation(pending) --> agent loop (<=5 tool calls + finalize)
-                                         |
-                     +-------------------+-------------------+
-                     |    search_telemetry, search_deployments,   |
-                     |    retrieve_runbook, search_prior_incidents,|
-                     |    inspect_change  (read-only, bounded,     |
-                     |    schema-validated, logged)                |
-                     +-------------------+-------------------+
-                                         v
-                        Diagnosis (validated: every evidence_ref
-                        must have actually been returned by a tool
-                        call this investigation made)
-                                         v
-                              approve / reject (idempotent)
-                                         v
-                              postmortem draft (on approval)
-```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for the reasoning behind the non-obvious choices, and [BENCHMARKS.md](BENCHMARKS.md) for measured performance.
+The five diagnostic tools are read-only, schema-validated, result-bounded, and executed through a shared tool executor that records latency, structured errors, and Prometheus metrics.
+
+See:
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) for system design
+- [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for implementation tradeoffs
+- [BENCHMARKS.md](BENCHMARKS.md) for measured performance and methodology
 
 ## Setup
 
+Create the environment:
+
 ```bash
 cp .env.example .env
-docker compose up -d db
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements-dev.txt
+```
+
+Start PostgreSQL with pgvector:
+
+```bash
+docker compose up -d db
+```
+
+Apply the schema and seed the database:
+
+```bash
 alembic upgrade head
 python scripts/seed.py
 ```
 
-The seed script deterministically generates 1,200+ records (deployments, source changes, telemetry, runbooks, prior incidents) across 8 services.
+The deterministic seed currently produces 1,200+ operational records across eight services, including telemetry, deployments, source changes, runbooks, and prior incidents.
 
-Run the API:
+Run the API locally:
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-Or run the full stack (API + Postgres/pgvector + Prometheus + Grafana):
+Or start the complete stack:
 
 ```bash
 docker compose up -d --build
 ```
 
-- API: http://localhost:8000 (docs at `/docs`)
-- Prometheus: http://localhost:9090
-- Grafana: http://localhost:3000 (anonymous viewer access enabled; admin/admin)
+Services:
 
-## Try it
+```text
+API         http://localhost:8000
+API docs    http://localhost:8000/docs
+Prometheus  http://localhost:9090
+Grafana     http://localhost:3000
+```
+
+Grafana is configured for local anonymous viewing. The default local administrator credentials are defined by the Docker Compose configuration.
+
+## Example workflow
+
+Create an alert:
 
 ```bash
-curl -X POST localhost:8000/alerts -H 'Content-Type: application/json' -d '{
-  "service": "checkout", "severity": "high",
-  "message": "connection pool exhausted", "fingerprint": "demo-1"
-}'
-# -> {"id":1,...,"investigation_id":1}
-
-curl -X POST localhost:8000/investigations/1/run     # runs the agent loop
-curl localhost:8000/investigations/1                 # inspect the diagnosis
-curl -X POST localhost:8000/investigations/1/approve  # approve -> postmortem
+curl -X POST http://localhost:8000/alerts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "service": "checkout",
+    "severity": "high",
+    "message": "connection pool exhausted",
+    "fingerprint": "demo-1"
+  }'
 ```
 
-## Testing
+Example response:
+
+```json
+{
+  "id": 1,
+  "investigation_id": 1
+}
+```
+
+Run the investigation:
 
 ```bash
-pytest -q                                   # 49 functional/integration tests
-pytest tests/test_fault_injection.py -q     # 250 parametrized fault-injection cases
-pytest -q --cov=app --cov-report=term-missing
+curl -X POST http://localhost:8000/investigations/1/run
 ```
 
-Both suites run entirely on the deterministic provider -- no network access or API key required. See [BENCHMARKS.md](BENCHMARKS.md) for `scripts/benchmark.py`.
+Inspect the result:
 
-## Repository layout
+```bash
+curl http://localhost:8000/investigations/1
+```
 
+Approve the investigation:
+
+```bash
+curl -X POST http://localhost:8000/investigations/1/approve
 ```
-app/
-  main.py, config.py, db.py, models.py, schemas.py, errors.py, metrics.py
-  embeddings/    EmbeddingProvider: deterministic (default) + OpenAI
-  reasoning/      ReasoningProvider (the agent): deterministic (default) + OpenAI
-  tools/           the 5 diagnostic tools + registry + executor
-  pipeline/         ingestion, investigation orchestration, diagnosis validation, postmortem
-  routers/           ingestion, alerts, investigations, health
-alembic/             one initial migration: schema + pgvector extension + HNSW indexes
-scripts/             seed.py, benchmark.py
-tests/               49 functional/integration tests, plus tests/faults/ (250-case fault-injection matrix)
-monitoring/          prometheus.yml, Grafana provisioning + the 8-panel dashboard
-.github/workflows/    CI: lint, migrate, test with coverage, seed
-```
+
+Approval is idempotent and generates a postmortem draft from the validated diagnosis.
 
 ## Diagnostic tools
 
-Five read-only, schema-validated, bounded, logged tools, callable only by the reasoning agent:
+FastTrack exposes exactly five diagnostic tools to the reasoning layer.
 
-| tool | purpose |
+| Tool | Purpose |
 |---|---|
-| `search_telemetry` | recent telemetry events for a service |
-| `search_deployments` | recent deployments for a service |
-| `retrieve_runbook` | pgvector similarity search over runbooks, flags staleness |
-| `search_prior_incidents` | pgvector similarity search over prior incidents |
-| `inspect_change` | a specific source change and any deployment that shipped it |
+| `search_telemetry` | Retrieve recent telemetry for a service |
+| `search_deployments` | Find recent deployments for a service |
+| `retrieve_runbook` | Search runbooks using pgvector similarity and report staleness |
+| `search_prior_incidents` | Search historical incidents using pgvector similarity |
+| `inspect_change` | Inspect a source change and any deployment associated with it |
+
+Each tool has:
+
+- a Pydantic input schema
+- a Pydantic output schema
+- bounded query results
+- deterministic ordering
+- read-only behavior
+- execution logging
+- structured failure handling
+- Prometheus instrumentation
+
+The same tool schemas can also be exposed to the OpenAI reasoning provider through function calling.
+
+## Providers
+
+### Deterministic providers
+
+The default providers require no external service.
+
+`DeterministicEmbeddingProvider` generates stable 1536-dimensional embeddings locally and stores them in pgvector.
+
+`DeterministicReasoningProvider` chooses its next diagnostic action based on evidence accumulated during the investigation rather than returning a fixed response.
+
+These providers are used for:
+
+- automated tests
+- CI
+- seed generation
+- benchmarks
+- reproducible local development
+
+### OpenAI providers
+
+FastTrack also includes:
+
+```text
+OpenAIEmbeddingProvider
+OpenAIProvider
+```
+
+They can be selected through environment configuration:
+
+```text
+EMBEDDING_PROVIDER=openai
+LLM_PROVIDER=openai
+OPENAI_API_KEY=...
+```
+
+Selecting an OpenAI-backed provider without a configured key fails explicitly rather than silently falling back to the deterministic implementation.
+
+## Evidence validation
+
+A diagnosis cannot cite arbitrary database records.
+
+Every `evidence_ref` is checked against the records actually returned by tool calls during the current investigation.
+
+This means a reference must satisfy more than:
+
+```text
+Does this row exist?
+```
+
+It must satisfy:
+
+```text
+Was this row actually retrieved during this investigation?
+```
+
+This prevents diagnoses from citing valid-looking records that were never observed by the reasoning layer.
+
+## Testing
+
+Run the functional and integration suite:
+
+```bash
+pytest -q
+```
+
+Current suite:
+
+```text
+49 functional/integration tests
+```
+
+Run the fault-injection matrix separately:
+
+```bash
+pytest tests/test_fault_injection.py -q
+```
+
+Current matrix:
+
+```text
+250 parametrized fault-injection cases
+```
+
+Run coverage:
+
+```bash
+pytest -q --cov=app --cov-report=term-missing
+```
+
+Current measured line coverage is approximately 90%.
+
+The automated test suite uses the deterministic providers and requires no OpenAI API key or external model calls.
+
+## Benchmarks
+
+Run:
+
+```bash
+python scripts/benchmark.py --n 200 --warmup 20
+```
+
+The benchmark measures FastTrack's local backend path with the deterministic providers.
+
+Across three recorded 200-request runs, full incident-analysis p95 ranged from:
+
+```text
+13.0 ms to 17.3 ms
+```
+
+A conservative single summary value is:
+
+```text
+17.3 ms p95
+```
+
+This measurement excludes live OpenAI network latency.
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the full methodology, raw ranges, benchmark paths, and limitations.
 
 ## Monitoring
 
-8 Prometheus metrics (request latency, tool execution duration/failures, retrieval duration, ingestion count, investigation count, LLM call duration/count) feed an 8-panel Grafana dashboard provisioned automatically on `docker compose up`.
+FastTrack exposes eight Prometheus metrics covering:
+
+- HTTP latency
+- tool execution duration
+- tool execution failures
+- retrieval latency
+- ingestion volume
+- investigation counts
+- reasoning-provider latency
+- reasoning-provider calls
+
+Grafana is provisioned automatically with eight panels for request, retrieval, tool, ingestion, investigation, and provider behavior.
+
+Configuration lives under:
+
+```text
+monitoring/
+```
+
+## Repository layout
+
+```text
+app/
+  main.py
+  config.py
+  db.py
+  models.py
+  schemas.py
+  errors.py
+  metrics.py
+
+  embeddings/
+    base.py
+    deterministic.py
+    openai_provider.py
+    factory.py
+
+  reasoning/
+    base.py
+    deterministic.py
+    openai_provider.py
+    factory.py
+
+  tools/
+    base.py
+    executor.py
+    search_telemetry.py
+    search_deployments.py
+    retrieve_runbook.py
+    search_prior_incidents.py
+    inspect_change.py
+
+  pipeline/
+    ingestion.py
+    investigation.py
+    diagnosis_validation.py
+    postmortem.py
+
+  routers/
+    ingestion.py
+    alerts.py
+    investigations.py
+    health.py
+
+alembic/
+  versions/
+    0001_initial.py
+
+scripts/
+  seed.py
+  benchmark.py
+
+tests/
+  faults/
+  test_*.py
+
+monitoring/
+  prometheus.yml
+  grafana/
+
+.github/
+  workflows/
+    ci.yml
+```
+
+## CI
+
+The GitHub Actions workflow runs with deterministic providers and no model-provider credentials.
+
+CI performs:
+
+```text
+lint
+→ database migration
+→ automated tests
+→ coverage
+→ deterministic seed verification
+```
+
+PostgreSQL with pgvector is used during CI so database and vector-retrieval behavior are exercised against the same database technology used by the application.
